@@ -2,6 +2,7 @@ package goproxy
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -30,6 +31,12 @@ type ProxyHttpServer struct {
 	// if nil Tr.Dial will be used
 	ConnectDial func(network string, addr string) (net.Conn, error)
 	CertStore   CertStorage
+	// Resolver method Resolve will be used to convert destination name to destination address.
+	// If nil net.ResolveTCPAddr will be used for relosolving.
+	Resolver Resolver
+	// ConnectOK is a message will be passed along with code 200 as successful CONNECT answer
+	// If empty string "HTTP/1.0 200 OK\r\n\r\n" will be used
+	ConnectOK []byte
 }
 
 var hasPort = regexp.MustCompile(`:\d+$`)
@@ -98,12 +105,18 @@ func removeProxyHeaders(ctx *ProxyCtx, r *http.Request) {
 
 // Standard net/http function. Shouldn't be used directly, http.Serve will use it.
 func (proxy *ProxyHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
+
+	defer func() {
+		if ctx.OnDone != nil {
+			ctx.OnDone()
+		}
+	}()
+
 	//r.Header["X-Forwarded-For"] = w.RemoteAddr()
 	if r.Method == "CONNECT" {
-		proxy.handleHttps(w, r)
+		proxy.handleHttps(w, r, ctx)
 	} else {
-		ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
-
 		var err error
 		ctx.Logf("Got request %v %v %v %v", r.URL.Path, r.Host, r.Method, r.URL.String())
 		if !r.URL.IsAbs() {
@@ -153,7 +166,7 @@ func (proxy *ProxyHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 		copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
 		w.WriteHeader(resp.StatusCode)
-		nr, err := io.Copy(w, resp.Body)
+		nr, err := loopCopy(w, resp.Body, fmt.Sprintf("%d http out", ctx.Session), ctx.logger())
 		if err := resp.Body.Close(); err != nil {
 			ctx.Warnf("Can't close response body %v", err)
 		}

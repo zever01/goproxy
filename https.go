@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -13,7 +14,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 )
 
@@ -26,6 +26,10 @@ const (
 	ConnectHijack
 	ConnectHTTPMitm
 	ConnectProxyAuthHijack
+)
+
+var (
+	msgConnectOK = []byte("HTTP/1.0 200 OK\r\n\r\n")
 )
 
 var (
@@ -54,7 +58,24 @@ func (proxy *ProxyHttpServer) dial(network, addr string) (c net.Conn, err error)
 	if proxy.Tr.Dial != nil {
 		return proxy.Tr.Dial(network, addr)
 	}
-	return net.Dial(network, addr)
+
+	if proxy.Resolver != nil {
+
+	}
+
+	dst, err := proxy.resolve(addr)
+	if err != nil {
+		return nil, err
+	}
+	return net.DialTCP("tcp", &net.TCPAddr{IP: net.IPv4zero}, dst)
+}
+
+func (proxy *ProxyHttpServer) resolve(addr string) (*net.TCPAddr, error) {
+	if proxy.Resolver != nil {
+		return proxy.Resolver.Resolve(addr)
+	}
+
+	return net.ResolveTCPAddr("tcp", addr)
 }
 
 func (proxy *ProxyHttpServer) connectDial(network, addr string) (c net.Conn, err error) {
@@ -64,9 +85,7 @@ func (proxy *ProxyHttpServer) connectDial(network, addr string) (c net.Conn, err
 	return proxy.ConnectDial(network, addr)
 }
 
-func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
-	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy, certStore: proxy.CertStore}
-
+func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request, ctx *ProxyCtx) {
 	hij, ok := w.(http.Hijacker)
 	if !ok {
 		panic("httpserver does not support hijacking")
@@ -94,31 +113,25 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		if !hasPort.MatchString(host) {
 			host += ":80"
 		}
-		targetSiteCon, err := proxy.connectDial("tcp", host)
+		targetSiteCon, err := ctx.connectDial("tcp", host)
 		if err != nil {
 			httpError(proxyClient, ctx, err)
 			return
 		}
-		ctx.Logf("Accepting CONNECT to %s", host)
-		proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+		ctx.Logf("%d Accepting CONNECT to %s", ctx.Session, host)
 
-		targetTCP, targetOK := targetSiteCon.(*net.TCPConn)
-		proxyClientTCP, clientOK := proxyClient.(*net.TCPConn)
-		if targetOK && clientOK {
-			go copyAndClose(ctx, targetTCP, proxyClientTCP)
-			go copyAndClose(ctx, proxyClientTCP, targetTCP)
+		if ctx.proxy.ConnectOK != nil {
+			proxyClient.Write(ctx.proxy.ConnectOK)
 		} else {
-			go func() {
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go copyOrWarn(ctx, targetSiteCon, proxyClient, &wg)
-				go copyOrWarn(ctx, proxyClient, targetSiteCon, &wg)
-				wg.Wait()
-				proxyClient.Close()
-				targetSiteCon.Close()
-
-			}()
+			proxyClient.Write(msgConnectOK)
 		}
+
+		pipeInOut(
+			proxyClient,
+			targetSiteCon.(outgoingConn),
+			fmt.Sprintf("%d CONNECT", ctx.Session),
+			ctx.logger(),
+		)
 
 	case ConnectHijack:
 		ctx.Logf("Hijacking CONNECT to %s", host)
@@ -249,7 +262,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					return
 				}
 				chunked := newChunkedWriter(rawClientTls)
-				if _, err := io.Copy(chunked, resp.Body); err != nil {
+				if _, err := loopCopy(chunked, resp.Body, fmt.Sprintf("%d https-chunked out", ctx.Session), ctx.logger()); err != nil {
 					ctx.Warnf("Cannot write TLS response body from mitm'd client: %v", err)
 					return
 				}
@@ -286,15 +299,8 @@ func httpError(w io.WriteCloser, ctx *ProxyCtx, err error) {
 	}
 }
 
-func copyOrWarn(ctx *ProxyCtx, dst io.Writer, src io.Reader, wg *sync.WaitGroup) {
-	if _, err := io.Copy(dst, src); err != nil {
-		ctx.Warnf("Error copying to client: %s", err)
-	}
-	wg.Done()
-}
-
-func copyAndClose(ctx *ProxyCtx, dst, src *net.TCPConn) {
-	if _, err := io.Copy(dst, src); err != nil {
+func copyAndClose(ctx *ProxyCtx, dst, src *net.TCPConn, id string) {
+	if _, err := loopCopy(dst, src, id, ctx.logger()); err != nil {
 		ctx.Warnf("Error copying to client: %s", err)
 	}
 
