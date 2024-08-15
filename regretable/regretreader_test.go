@@ -2,7 +2,7 @@ package regretable_test
 
 import (
 	"bytes"
-	. "github.com/elazarl/goproxy/regretable"
+	. "github.com/zever01/goproxy/regretable"
 	"io"
 	"io/ioutil"
 	"strings"
