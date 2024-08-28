@@ -219,19 +219,6 @@ func NewProxyHttpServer() *ProxyHttpServer {
 		}),
 	}
 
-	localAddr := &net.TCPAddr{
-		IP: net.ParseIP(localIP),
-	}
-	dialer := &net.Dialer{
-		LocalAddr: localAddr,
-	}
-
-	proxy.Tr = &http.Transport{
-		TLSClientConfig: tlsClientSkipVerify,
-		Proxy:           http.ProxyFromEnvironment,
-		DialContext:     dialer.DialContext,
-	}
-
 	proxy.ConnectDial = dialerFromEnv(&proxy)
 
 	return &proxy
